@@ -1,24 +1,27 @@
 //! EncryptoNote：加密笔记（`.ecnote`）应用主界面。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Id, Layout, Margin, RichText, Sense, Stroke,
     pos2, vec2,
 };
 use egui_richedit::{Position, Selection};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::editor::{self, ActiveSheet, SheetEditor, mark_of};
 use crate::model::{Align as DocAlign, Block, BlockKind, ImageAsset, Run, Sheet};
 use crate::recent::{self, RecentEntry};
+use crate::settings::{Settings, UnlockRetention};
 use crate::store::{self, Opened};
 use crate::ui::{theme, widgets};
 
 const PAGE_SIDE: f32 = 80.0;
 const PAGE_TOP: f32 = 76.0;
 const PAGE_BOTTOM: f32 = 128.0;
+const AUTO_SAVE_DELAY: Duration = Duration::from_millis(1500);
 
 const SHEET_COLORS: [(&str, &str); 8] = [
     ("无颜色", ""),
@@ -70,6 +73,32 @@ struct PwDialog {
     error: Option<String>,
 }
 
+impl Drop for PwDialog {
+    fn drop(&mut self) {
+        self.p1.zeroize();
+        self.p2.zeroize();
+    }
+}
+
+impl Drop for UnlockState {
+    fn drop(&mut self) {
+        self.password.zeroize();
+    }
+}
+
+#[derive(Default)]
+struct SettingsDialog {
+    open: bool,
+    custom: bool,
+    custom_minutes: u16,
+    error: Option<String>,
+}
+
+struct CachedEditor {
+    editor: EditorCtx,
+    left_at: Instant,
+}
+
 struct Toast {
     text: String,
     until: Instant,
@@ -80,6 +109,8 @@ pub struct EditorCtx {
     sheets: Vec<SheetEditor>,
     active: usize,
     dirty: bool,
+    last_edit: Option<Instant>,
+    auto_save_failed: bool,
     pw: PwDialog,
     rename: Option<(usize, String, bool)>,
     delete_confirm: Option<usize>,
@@ -95,7 +126,7 @@ impl EditorCtx {
             .sheets
             .iter()
             .map(|s| {
-                let mut e = SheetEditor::new(Id::unique(("ecnote-editor", &s.id)));
+                let mut e = SheetEditor::new(Id::unique(("ecnote-editor", &opened.path, &s.id)));
                 e.editor
                     .select(Selection::caret(Position::new(0usize, 0usize)));
                 e
@@ -106,6 +137,8 @@ impl EditorCtx {
             sheets,
             active,
             dirty: false,
+            last_edit: None,
+            auto_save_failed: false,
             pw: PwDialog {
                 open: false,
                 p1: String::new(),
@@ -118,6 +151,14 @@ impl EditorCtx {
         }
     }
 
+    /// 收集本帧修改，既保留旧的未保存状态，也能对连续编辑重新计时。
+    fn finish_edit_frame(&mut self, was_dirty: bool, now: Instant) {
+        if self.dirty {
+            self.last_edit = Some(now);
+            self.auto_save_failed = false;
+        }
+        self.dirty |= was_dirty;
+    }
 }
 
 #[derive(PartialEq)]
@@ -136,6 +177,10 @@ pub struct App {
     toast: Option<Toast>,
     new_dir: Option<PathBuf>,
     open_error: Option<String>,
+    settings: Settings,
+    settings_path: PathBuf,
+    settings_dialog: SettingsDialog,
+    cached: Vec<CachedEditor>,
 }
 
 impl Default for App {
@@ -150,6 +195,10 @@ impl Default for App {
             toast: None,
             new_dir: None,
             open_error: None,
+            settings: Settings::load(&Settings::path()),
+            settings_path: Settings::path(),
+            settings_dialog: SettingsDialog::default(),
+            cached: Vec::new(),
         };
         if let Some(home) = std::env::var_os("ECNOTE_HOME") {
             let dir = PathBuf::from(home);
@@ -314,48 +363,107 @@ impl App {
             self.refresh_entries();
             return;
         }
-        self.editor = Some(EditorCtx::new(opened));
-        self.view = View::Editor;
-        self.new.open = false;
-        self.unlock = None;
-        self.pending = None;
-        self.refresh_entries();
+        self.activate_editor(EditorCtx::new(opened));
         self.toast(format!("已解锁 {name}"));
     }
 
-    fn leave_editor(&mut self) {
-        if let Some(ed) = &mut self.editor
-            && ed.dirty
-        {
-            if ed.opened.save().is_err() {
-                self.toast("保存失败，已留在编辑器");
-                return;
-            }
-        }
-        self.editor = None;
-        self.view = View::Library;
+    fn activate_editor(&mut self, mut editor: EditorCtx) {
+        editor.focus_editor = true;
+        self.editor = Some(editor);
+        self.view = View::Editor;
+        self.new.open = false;
+        self.new.password.zeroize();
+        self.new.confirm.zeroize();
+        self.unlock = None;
+        self.pending = None;
         self.refresh_entries();
     }
 
-    fn save_now(&mut self) {
-        let mut notify: Option<String> = None;
-        if let Some(ed) = &mut self.editor {
-            if ed.opened.over_limit() {
-                notify = Some("内容已超过 100 万字符，无法保存；请删减内容".to_owned());
-            } else {
-                match ed.opened.save() {
-                    Ok(()) => {
-                        ed.dirty = false;
-                        notify = Some("已保存".to_owned());
-                    }
-                    Err(e) => notify = Some(format!("保存失败：{e:#}")),
-                }
-            }
+    fn expire_cached(&mut self, now: Instant) {
+        if let Some(duration) = self.settings.unlock_retention.duration() {
+            self.cached.retain(|entry| now.saturating_duration_since(entry.left_at) < duration);
         }
-        if let Some(msg) = notify {
-            self.toast(msg);
+    }
+
+    fn cache_current(&mut self, now: Instant) {
+        let Some(mut editor) = self.editor.take() else { return };
+        self.cached.retain(|entry| !same_note(&entry.editor.opened.path, &editor.opened.path));
+        if self.settings.unlock_retention == UnlockRetention::Immediate {
+            return;
+        }
+        // 缓存编辑上下文，但不保留密码输入框或未完成的模态操作。
+        editor.pw = PwDialog { open: false, p1: String::new(), p2: String::new(), error: None };
+        editor.rename = None;
+        editor.delete_confirm = None;
+        self.cached.push(CachedEditor { editor, left_at: now });
+    }
+
+    fn leave_editor(&mut self, lock: bool) -> bool {
+        if let Err(error) = self.save_current() {
+            self.toast(format!("保存失败，已留在编辑器：{error}"));
+            return false;
+        }
+        if lock {
+            if let Some(ed) = self.editor.take() {
+                self.cached.retain(|entry| !same_note(&entry.editor.opened.path, &ed.opened.path));
+            }
+        } else {
+            self.cache_current(Instant::now());
+        }
+        self.view = View::Library;
+        self.refresh_entries();
+        if lock {
+            self.toast("已锁定当前笔记");
+        }
+        true
+    }
+
+    fn save_current(&mut self) -> Result<(), String> {
+        let Some(ed) = &mut self.editor else { return Ok(()) };
+        if !ed.dirty {
+            return Ok(());
+        }
+        if let Err(error) = ed.opened.save_with_backup(self.settings.backup) {
+            ed.auto_save_failed = true;
+            return Err(format!("{error:#}"));
+        }
+        ed.dirty = false;
+        ed.last_edit = None;
+        ed.auto_save_failed = false;
+        Ok(())
+    }
+
+    fn save_now(&mut self) {
+        match self.save_current() {
+            Ok(()) => self.toast("已保存"),
+            Err(error) => self.toast(format!("保存失败：{error}")),
         }
         self.refresh_entries();
+    }
+
+    fn poll_auto_save(&mut self, ctx: &egui::Context, now: Instant) {
+        if !self.settings.auto_save || self.dialog_open() || self.pending.is_some() {
+            return;
+        }
+        let Some(ed) = &mut self.editor else { return };
+        if !ed.dirty || ed.auto_save_failed {
+            return;
+        }
+        let last_edit = *ed.last_edit.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(last_edit);
+        if elapsed < AUTO_SAVE_DELAY {
+            ctx.request_repaint_after(AUTO_SAVE_DELAY - elapsed);
+            return;
+        }
+        if let Err(error) = self.save_current() {
+            self.toast(format!("自动保存失败：{error}；请重试保存"));
+        }
+        ctx.request_repaint();
+    }
+
+    fn dialog_open(&self) -> bool {
+        self.settings_dialog.open || self.new.open || self.unlock.is_some()
+            || self.editor.as_ref().is_some_and(|ed| ed.pw.open || ed.delete_confirm.is_some())
     }
 
     fn poll_pending(&mut self) {
@@ -366,26 +474,23 @@ impl App {
                 self.pending = None;
                 if let Some(ed) = &mut self.editor {
                     // 重复拖入当前笔记时保留内存中的编辑，避免用磁盘旧内容覆盖。
-                    let same_file = ed.opened.path == opened.path
-                        || std::fs::canonicalize(&ed.opened.path).ok()
-                            .zip(std::fs::canonicalize(&opened.path).ok())
-                            .is_some_and(|(current, next)| current == next);
-                    if same_file {
+                    if same_note(&ed.opened.path, &opened.path) {
                         ed.focus_editor = true;
                         self.unlock = None;
                         return;
                     }
-                    // 新笔记验证成功后再保存、切换；验证失败不碰当前笔记。
-                    if ed.dirty
-                        && let Err(e) = ed.opened.save()
-                    {
-                        if let Some(u) = &mut self.unlock {
-                            u.error = Some(format!("当前笔记保存失败：{e:#}"));
-                            u.busy = false;
-                        }
-                        return;
-                    }
                 }
+                // 新笔记验证成功后再保存、切换；验证失败不碰当前笔记。
+                if let Err(error) = self.save_current() {
+                    if let Some(u) = &mut self.unlock {
+                        u.error = Some(format!("当前笔记保存失败：{error}"));
+                        u.busy = false;
+                    } else {
+                        self.new.error = Some(format!("当前笔记保存失败：{error}"));
+                    }
+                    return;
+                }
+                self.cache_current(Instant::now());
                 if task {
                     self.toast(format!("已创建「{}」", opened.file_name()));
                 }
@@ -405,6 +510,9 @@ impl App {
             }
             Err(TryRecvError::Disconnected) => {
                 self.pending = None;
+                if let Some(u) = &mut self.unlock {
+                    u.busy = false;
+                }
                 self.toast("后台任务异常结束");
             }
             Err(TryRecvError::Empty) => {}
@@ -431,7 +539,7 @@ impl App {
         }
         self.new.error = None;
         self.new_dir = Some(dir.clone());
-        let pw = self.new.password.clone();
+        let pw = Zeroizing::new(self.new.password.clone());
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let res = store::create(&dir, &name, &pw).map_err(|e| format!("{e:#}"));
@@ -451,7 +559,7 @@ impl App {
             return;
         }
         let path = u.path.clone();
-        let pw = u.password.clone();
+        let pw = Zeroizing::new(std::mem::take(&mut u.password));
         u.error = None;
         u.busy = true;
         let (tx, rx) = channel();
@@ -467,6 +575,33 @@ impl App {
     }
 
     fn open_path(&mut self, path: PathBuf) {
+        if self.pending.is_some() {
+            return;
+        }
+        if let Some(ed) = &mut self.editor
+            && same_note(&ed.opened.path, &path)
+        {
+            ed.focus_editor = true;
+            self.unlock = None;
+            return;
+        }
+        self.expire_cached(Instant::now());
+        if let Some(index) = self.cached.iter().position(|entry| same_note(&entry.editor.opened.path, &path)) {
+            if self.cached[index].editor.opened.matches_disk() {
+                if let Err(error) = self.save_current() {
+                    self.toast(format!("当前笔记保存失败：{error}"));
+                    return;
+                }
+                let cached = self.cached.remove(index);
+                self.cache_current(Instant::now());
+                let opened = &cached.editor.opened;
+                let size = std::fs::metadata(&opened.path).map(|m| m.len()).unwrap_or(0);
+                recent::touch(&opened.path, &opened.doc.title, size);
+                self.activate_editor(cached.editor);
+                return;
+            }
+            self.cached.remove(index);
+        }
         let title = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -481,7 +616,7 @@ impl App {
     }
 
     fn handle_dropped_files(&mut self, ctx: &egui::Context) {
-        if self.pending.is_some() || self.new.open
+        if self.pending.is_some() || self.settings_dialog.open || self.new.open
             || self.editor.as_ref().is_some_and(|ed| ed.pw.open || ed.delete_confirm.is_some())
         {
             return;
@@ -502,11 +637,17 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.handle_dropped_files(&ctx);
-        if self.new.open
-            || self.unlock.is_some()
-            || self.editor.as_ref().is_some_and(|e| e.pw.open)
+        let now = Instant::now();
+        self.expire_cached(now);
+        if let Some(duration) = self.settings.unlock_retention.duration()
+            && let Some(remaining) = self.cached.iter()
+                .map(|entry| duration.saturating_sub(now.saturating_duration_since(entry.left_at)))
+                .min()
         {
+            ctx.request_repaint_after(remaining);
+        }
+        self.handle_dropped_files(&ctx);
+        if self.dialog_open() {
             // 对话框内容会随输入增长，保持连续重绘让窗口尺寸/命中区域及时更新
             ctx.request_repaint();
         }
@@ -529,7 +670,170 @@ impl eframe::App for App {
             Self::change_pw_dialog(&ctx, ed, &mut self.toast);
         }
         self.sheet_dialogs(&ctx);
+        self.settings_ui(&ctx);
+        self.poll_auto_save(&ctx, Instant::now());
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if let Err(error) = self.save_current() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.toast(format!("保存失败，已取消关闭：{error}"));
+            } else {
+                self.cached.clear();
+                self.editor = None;
+            }
+        }
         self.toast_ui(&ctx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 设置
+// ---------------------------------------------------------------------------
+
+impl App {
+    fn open_settings(&mut self) {
+        let retention = self.settings.unlock_retention;
+        self.settings_dialog = SettingsDialog {
+            open: true,
+            custom: matches!(retention, UnlockRetention::Minutes(n) if ![1, 5, 15, 60].contains(&n)),
+            custom_minutes: match retention {
+                UnlockRetention::Minutes(n) => n,
+                _ => 15,
+            },
+            error: None,
+        };
+    }
+
+    fn apply_settings(&mut self, next: Settings) -> Result<(), String> {
+        next.save(&self.settings_path).map_err(|error| format!("{error:#}"))?;
+        let now = Instant::now();
+        // 先按原时长清掉已过期会话，延长时长不能恢复它们。
+        self.expire_cached(now);
+        self.settings = next;
+        self.expire_cached(now);
+        if let Some(ed) = &mut self.editor {
+            ed.auto_save_failed = false;
+            if ed.dirty {
+                ed.last_edit = Some(now);
+            }
+        }
+        Ok(())
+    }
+
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        if !self.settings_dialog.open {
+            return;
+        }
+        let mut next = self.settings;
+        let mut done = false;
+        let mut lock = false;
+        let has_editor = self.editor.is_some();
+        let state = &mut self.settings_dialog;
+        let dismissed = modal(ctx, "settings", 420.0, |ui| {
+            let modal_layer = ui.layer_id();
+            ui.label(RichText::new("设置").size(18.0).strong());
+            ui.add_space(12.0);
+
+            let selected = if state.custom {
+                "自定义".to_owned()
+            } else {
+                match next.unlock_retention {
+                    UnlockRetention::Immediate => "立即".to_owned(),
+                    UnlockRetention::Minutes(60) => "1 小时".to_owned(),
+                    UnlockRetention::Minutes(n) => format!("{n} 分钟"),
+                    UnlockRetention::UntilExit => "直到退出应用".to_owned(),
+                }
+            };
+            ui.horizontal(|ui| {
+                widgets::tooltip(
+                    ui.label("离开后重新锁定"),
+                    "每篇笔记单独计时，再次离开后重新计时。\n正在编辑的笔记不会自动锁定；关闭应用后需重新解锁。",
+                    None,
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    egui::ComboBox::from_id_salt("unlock_retention")
+                        .selected_text(selected)
+                        .width(180.0)
+                        .height(300.0)
+                        .show_ui(ui, |ui| {
+                            // 点击弹窗空白处会将弹窗置顶，菜单必须随父层保持在其上方。
+                            ui.ctx().set_sublayer(modal_layer, ui.layer_id());
+                            for (label, value) in [
+                                ("立即", UnlockRetention::Immediate),
+                                ("1 分钟", UnlockRetention::Minutes(1)),
+                                ("5 分钟", UnlockRetention::Minutes(5)),
+                                ("15 分钟", UnlockRetention::Minutes(15)),
+                                ("1 小时", UnlockRetention::Minutes(60)),
+                                ("直到退出应用", UnlockRetention::UntilExit),
+                            ] {
+                                if ui.selectable_label(!state.custom && next.unlock_retention == value, label).clicked() {
+                                    next.unlock_retention = value;
+                                    state.custom = false;
+                                }
+                            }
+                            if ui.selectable_label(state.custom, "自定义").clicked() {
+                                state.custom = true;
+                                next.unlock_retention = UnlockRetention::Minutes(state.custom_minutes);
+                            }
+                        });
+                });
+            });
+            if state.custom {
+                ui.horizontal(|ui| {
+                    ui.label("自定义时长");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let response = ui.add(egui::DragValue::new(&mut state.custom_minutes)
+                            .range(1..=1440).suffix(" 分钟"));
+                        if widgets::tooltip(response, "1–1440 分钟", None).changed() {
+                            next.unlock_retention = UnlockRetention::Minutes(state.custom_minutes);
+                        }
+                    });
+                });
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+            widgets::tooltip(
+                ui.checkbox(&mut next.auto_save, "自动保存"),
+                "停止编辑 1.5 秒后保存。",
+                None,
+            );
+            widgets::tooltip(
+                ui.checkbox(&mut next.backup, "保留一份加密备份"),
+                "保存前保留上一版本，位于笔记旁的 .ecnote.bak 文件。",
+                None,
+            );
+            if let Some(error) = &state.error {
+                ui.add_space(6.0);
+                ui.label(RichText::new(error).size(11.5).color(theme::DANGER));
+            }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                if has_editor && widgets::ghost_button(ui, "立即锁定", true, 100.0) {
+                    lock = true;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    done = widgets::primary_button(ui, "完成", true, 88.0);
+                });
+            });
+        });
+        if next != self.settings {
+            if let Err(error) = self.apply_settings(next) {
+                self.open_settings();
+                self.settings_dialog.error = Some(error);
+            } else {
+                self.settings_dialog.error = None;
+            }
+        }
+        if lock && self.leave_editor(true) {
+            done = true;
+        }
+        if done || dismissed {
+            self.settings_dialog.open = false;
+            if let Some(ed) = &mut self.editor {
+                ed.focus_editor = true;
+            }
+        }
     }
 }
 
@@ -552,44 +856,53 @@ impl App {
                     }),
             )
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("最近打开")
-                            .size(20.0)
-                            .strong()
-                            .color(theme::TEXT),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let new = ui.add(
-                            egui::Button::new(RichText::new("＋ 新建笔记").color(Color32::WHITE))
-                                .fill(theme::ACCENT)
-                                .corner_radius(9)
-                                .min_size(vec2(104.0, 34.0)),
+                ui.allocate_ui_with_layout(
+                    vec2(ui.available_width(), 34.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        let title = ui.painter().layout_no_wrap(
+                            "最近打开".to_owned(), FontId::proportional(20.0), theme::TEXT,
                         );
-                        if new.clicked() {
-                            self.new = NewState {
-                                open: true,
-                                dir: self.new_dir.clone(),
-                                ..Default::default()
-                            };
+                        let (rect, response) = ui.allocate_exact_size(vec2(title.size().x, 34.0), Sense::hover());
+                        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, "最近打开"));
+                        // 按字形实际边界居中，与齿轮共享视觉中心。
+                        let text_pos = pos2(rect.left(), rect.center().y - title.mesh_bounds.center().y);
+                        ui.painter().galley(text_pos, title, theme::TEXT);
+                        if icon_button(ui, Icon::Settings, 30.0, false, true).clicked() {
+                            self.open_settings();
                         }
-                        let open = ui.add(
-                            egui::Button::new(RichText::new("打开文件…").color(theme::TEXT))
-                                .fill(theme::CARD)
-                                .stroke(Stroke::new(1.0, theme::BORDER))
-                                .corner_radius(9)
-                                .min_size(vec2(96.0, 34.0)),
-                        );
-                        if open.clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .set_title("打开 EncryptoNote 笔记")
-                                .add_filter("EncryptoNote 笔记", &["ecnote"])
-                                .pick_file()
-                        {
-                            self.open_path(path);
-                        }
-                    });
-                });
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let new = ui.add(
+                                egui::Button::new(RichText::new("＋ 新建笔记").color(Color32::WHITE))
+                                    .fill(theme::ACCENT)
+                                    .corner_radius(9)
+                                    .min_size(vec2(104.0, 34.0)),
+                            );
+                            if new.clicked() {
+                                self.new = NewState {
+                                    open: true,
+                                    dir: self.new_dir.clone(),
+                                    ..Default::default()
+                                };
+                            }
+                            let open = ui.add(
+                                egui::Button::new(RichText::new("打开文件…").color(theme::TEXT))
+                                    .fill(theme::CARD)
+                                    .stroke(Stroke::new(1.0, theme::BORDER))
+                                    .corner_radius(9)
+                                    .min_size(vec2(96.0, 34.0)),
+                            );
+                            if open.clicked()
+                                && let Some(path) = rfd::FileDialog::new()
+                                    .set_title("打开 EncryptoNote 笔记")
+                                    .add_filter("EncryptoNote 笔记", &["ecnote"])
+                                    .pick_file()
+                            {
+                                self.open_path(path);
+                            }
+                        });
+                    },
+                );
             });
 
         if let Some(err) = self.open_error.take() {
@@ -820,10 +1133,12 @@ impl App {
 
     fn editor_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let was_blocked = self.dialog_open();
         let Some(mut ed) = self.editor.take() else {
             self.view = View::Library;
             return;
         };
+        let was_dirty = std::mem::take(&mut ed.dirty);
 
         // 图片被删后清掉残留的空图片块，避免留下「图片」占位
         if ed.opened.doc.prune_images() {
@@ -870,7 +1185,7 @@ impl App {
                             .strong()
                             .color(theme::TEXT),
                     );
-                    if ed.dirty {
+                    if ed.dirty || was_dirty {
                         ui.label(RichText::new("●").size(10.0).color(theme::WARN));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -890,10 +1205,15 @@ impl App {
                                 error: None,
                             };
                         }
+                        ui.add_space(2.0);
+                        if icon_button(ui, Icon::Settings, 30.0, false, true).clicked() {
+                            self.open_settings();
+                        }
                     });
                 });
             });
 
+        let blocked = was_blocked || self.settings_dialog.open || ed.pw.open || ed.delete_confirm.is_some();
         let active = ed.active;
         Self::toolbar(ui, &mut ed, &mut save_clicked);
 
@@ -933,7 +1253,7 @@ impl App {
                 let min_content_height =
                     (ui.available_height() - PAGE_TOP - PAGE_BOTTOM).max(0.0);
                 let scroll_out = egui::ScrollArea::vertical()
-                    .id_salt(("paper", &ed.opened.doc.sheets[active].id))
+                    .id_salt(("paper", &ed.opened.path, &ed.opened.doc.sheets[active].id))
                     .auto_shrink([false, false])
                     .vertical_scroll_offset(pinned.unwrap_or(ed.sheets[active].scroll))
                     .show(ui, |ui| {
@@ -968,6 +1288,7 @@ impl App {
                                     })
                                 });
                                 if let Some(img) = pasted_image
+                                    && !blocked
                                     && (rt.editor.has_focus(ui.ctx())
                                         || ui.memory(|m| m.has_focus(rt.id.with("image"))))
                                     && let Some(asset) = asset_from_color_image(&img)
@@ -981,14 +1302,16 @@ impl App {
                                     rt.insert_image(ui.ctx(), &mut sheet.blocks, id);
                                     ed.dirty = true;
                                 }
-                                let mut img_action = rt.image_input(ui, &mut sheet.blocks, &mut ed.dirty);
+                                let mut img_action = if blocked { None } else {
+                                    rt.image_input(ui, &mut sheet.blocks, &mut ed.dirty)
+                                };
                                 let mut model = ActiveSheet {
                                     blocks: &mut sheet.blocks,
                                     undo: &mut rt.undo,
                                     pending: &mut rt.pending,
                                     dirty: &mut ed.dirty,
                                 };
-                                let changed = rt.editor.input(ui, &mut model);
+                                let changed = !blocked && rt.editor.input(ui, &mut model);
                                 if changed {
                                     rt.selected_image = None;
                                 }
@@ -1027,14 +1350,14 @@ impl App {
             });
 
         // 在控件注册后恢复焦点，避免刚关闭的模态层让控件再次丢失焦点。
-        if ed.focus_editor {
+        if ed.focus_editor && !blocked {
             let rt = &ed.sheets[ed.active];
             let focus = if rt.selected_image.is_some() { rt.id.with("image") } else { rt.id };
             ui.memory_mut(|m| m.request_focus(focus));
             ed.focus_editor = false;
         }
 
-        let sc = if self.unlock.is_none() {
+        let sc = if !blocked {
             Self::shortcuts(&ctx, &mut ed)
         } else {
             ShortcutOut::default()
@@ -1046,20 +1369,14 @@ impl App {
             lock_clicked = true;
         }
 
+        ed.finish_edit_frame(was_dirty, Instant::now());
         self.editor = Some(ed);
 
-        if go_back || lock_clicked {
-            let dirty = self.editor.as_ref().is_some_and(|e| e.dirty);
-            if dirty {
-                self.save_now();
-            }
-        }
         if go_back {
-            self.leave_editor();
+            self.leave_editor(false);
         }
         if lock_clicked {
-            self.leave_editor();
-            self.toast("已锁定");
+            self.leave_editor(true);
         }
         if save_clicked {
             self.save_now();
@@ -1418,7 +1735,7 @@ impl App {
         let at = ed.active + 1;
         ed.opened.doc.sheets.insert(at, sheet);
         ed.sheets.insert(at, {
-            let mut e = SheetEditor::new(Id::unique(("ecnote-editor", &id)));
+            let mut e = SheetEditor::new(Id::unique(("ecnote-editor", &ed.opened.path, &id)));
             e.editor
                 .select(Selection::caret(Position::new(0usize, 0usize)));
             e
@@ -1452,7 +1769,7 @@ impl App {
             blocks: src.blocks,
         };
         ed.opened.doc.sheets.insert(idx + 1, sheet);
-        let mut e = SheetEditor::new(Id::unique(("ecnote-editor", &id)));
+        let mut e = SheetEditor::new(Id::unique(("ecnote-editor", &ed.opened.path, &id)));
         e.editor
             .select(Selection::caret(Position::new(0usize, 0usize)));
         ed.sheets.insert(idx + 1, e);
@@ -1708,6 +2025,8 @@ impl App {
             if let Some(ed) = &mut self.editor {
                 ed.delete_confirm = None;
                 Self::delete_sheet(ed, idx);
+                ed.last_edit = Some(Instant::now());
+                ed.auto_save_failed = false;
             }
         } else if (cancel || dismissed) && let Some(ed) = &mut self.editor {
             ed.delete_confirm = None;
@@ -1727,6 +2046,10 @@ impl App {
                     .size(11.5)
                     .color(theme::DIM),
             );
+            if ed.opened.backup_path().is_file() {
+                ui.label(RichText::new("已有备份仍使用原密码，下次保存后更新。")
+                    .size(11.5).color(theme::DIM));
+            }
             ui.add_space(10.0);
             pw_field(ui, &mut ed.pw.p1, "新密码（至少 6 位）");
             ui.add_space(6.0);
@@ -1761,6 +2084,8 @@ impl App {
                 match ed.opened.change_password(&ed.pw.p1) {
                     Ok(()) => {
                         ed.pw.open = false;
+                        ed.pw.p1.zeroize();
+                        ed.pw.p2.zeroize();
                         *toast = Some(Toast {
                             text: "密码已修改".to_owned(),
                             until: Instant::now() + std::time::Duration::from_secs(3),
@@ -1863,6 +2188,8 @@ impl App {
         }
         if cancel || dismissed {
             self.new.open = false;
+            self.new.password.zeroize();
+            self.new.confirm.zeroize();
         }
         if create {
             self.start_create(ctx);
@@ -1988,6 +2315,12 @@ enum SheetAction {
 // 小工具
 // ---------------------------------------------------------------------------
 
+fn same_note(left: &Path, right: &Path) -> bool {
+    left == right || std::fs::canonicalize(left).ok()
+        .zip(std::fs::canonicalize(right).ok())
+        .is_some_and(|(left, right)| left == right)
+}
+
 fn clean_sheet_name(buf: &str, sheets: &[Sheet], idx: usize) -> Option<String> {
     let name: String = buf
         .trim()
@@ -2075,6 +2408,7 @@ enum Icon {
     Align(DocAlign),
     Key,
     Lock,
+    Settings,
     Image,
     Clear,
     Save,
@@ -2099,6 +2433,7 @@ impl Icon {
             Self::Align(DocAlign::Justify) => "两端对齐",
             Self::Key => "修改密码",
             Self::Lock => "锁定",
+            Self::Settings => "设置",
             Self::Image => "插入剪贴板图片",
             Self::Clear => "清除格式",
             Self::Save => "保存",
@@ -2211,6 +2546,19 @@ impl Icon {
                 curve([(-3.5, -4.0), (-3.5, -9.0), (3.5, -9.0), (3.5, -4.0)]);
                 line(&[(3.5, -4.0), (3.5, -1.0)]);
                 line(&[(0.0, 2.5), (0.0, 5.0)]);
+            }
+            Self::Settings => {
+                // 八齿轮廓和中心圆，沿用工具栏的细线、留白与尺寸。
+                let mut points = Vec::with_capacity(65);
+                for tooth in 0..8 {
+                    for (offset, radius) in [(0.0, 6.0), (0.18, 8.0), (0.52, 8.0), (0.70, 6.0)] {
+                        let angle = (tooth as f32 + offset) * std::f32::consts::TAU / 8.0;
+                        points.push(c + vec2(angle.cos(), angle.sin()) * radius);
+                    }
+                }
+                points.push(points[0]);
+                p.add(egui::Shape::line(points, stroke));
+                p.circle_stroke(c, 2.6, stroke);
             }
             Self::Image => {
                 p.rect_stroke(egui::Rect::from_center_size(c, vec2(16.0, 14.0)),
@@ -2591,6 +2939,318 @@ fn restore_history_selection(
 mod tests {
     use super::*;
 
+    struct SessionDir(PathBuf);
+
+    impl SessionDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("ecnote-session-{}", recent::random_id()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn app(&self) -> App {
+            let settings_path = self.0.join("settings.json");
+            App {
+                view: View::Library,
+                entries: Vec::new(),
+                new: NewState::default(),
+                unlock: None,
+                pending: None,
+                editor: None,
+                toast: None,
+                new_dir: None,
+                open_error: None,
+                settings: Settings::load(&settings_path),
+                settings_path,
+                settings_dialog: SettingsDialog::default(),
+                cached: Vec::new(),
+            }
+        }
+    }
+
+    impl Drop for SessionDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn cached_notes_keep_independent_editors_and_lock_only_current_note() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        let first = store::create_test_note(&dir.0, "第一篇");
+        let first_path = first.path.clone();
+        let second = store::create_test_note(&dir.0, "第二篇");
+        let second_path = second.path.clone();
+        app.enter_editor(first);
+        let ed = app.editor.as_mut().unwrap();
+        let first_id = ed.sheets[0].id;
+        ed.sheets[0].scroll = 123.0;
+        ed.sheets[0].undo.snapshot(&ed.opened.doc.sheets[0].blocks);
+        ed.sheets[0].editor.select(Selection::caret(Position::new(0, 0)));
+        assert!(app.leave_editor(false));
+        let first_left = app.cached[0].left_at;
+        app.enter_editor(second);
+        assert_ne!(app.editor.as_ref().unwrap().sheets[0].id, first_id);
+        assert!(app.leave_editor(false));
+        assert_eq!(app.cached.len(), 2);
+
+        app.open_path(first_path.clone());
+        assert!(app.unlock.is_none());
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.opened.path, first_path);
+        assert_eq!(ed.sheets[0].scroll, 123.0);
+        assert_eq!(ed.sheets[0].undo.undo.len(), 1);
+        assert!(app.leave_editor(false));
+        assert!(app.cached.iter().find(|e| e.editor.opened.path == first_path).unwrap().left_at >= first_left);
+
+        app.open_path(first_path.clone());
+        assert!(app.leave_editor(true));
+        assert_eq!(app.cached.len(), 1);
+        assert_eq!(app.cached[0].editor.opened.path, second_path);
+        app.open_path(first_path);
+        assert!(app.unlock.is_some());
+        app.unlock = None;
+        app.open_path(second_path.clone());
+        assert!(app.unlock.is_none());
+        assert_eq!(app.editor.as_ref().unwrap().opened.path, second_path);
+    }
+
+    #[test]
+    fn retention_expiry_immediate_and_application_restart_require_passwords() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        let note = store::create_test_note(&dir.0, "计时");
+        let path = note.path.clone();
+        let start = Instant::now();
+        app.enter_editor(note);
+        app.cache_current(start);
+        app.view = View::Library;
+        app.expire_cached(start + Duration::from_secs(899));
+        assert_eq!(app.cached.len(), 1);
+        app.expire_cached(start + Duration::from_secs(900));
+        assert!(app.cached.is_empty());
+        app.open_path(path.clone());
+        assert!(app.unlock.is_some());
+
+        app.enter_editor(store::open(&path, "test-password").unwrap());
+        let mut settings = app.settings;
+        settings.unlock_retention = UnlockRetention::UntilExit;
+        app.apply_settings(settings).unwrap();
+        app.cache_current(start);
+        app.expire_cached(start + Duration::from_secs(60 * 60 * 48));
+        assert_eq!(app.cached.len(), 1);
+        drop(app);
+        let mut restarted = dir.app();
+        assert_eq!(restarted.settings.unlock_retention, UnlockRetention::UntilExit);
+        restarted.open_path(path.clone());
+        assert!(restarted.unlock.is_some());
+        restarted.enter_editor(store::open(&path, "test-password").unwrap());
+        settings.unlock_retention = UnlockRetention::Immediate;
+        restarted.apply_settings(settings).unwrap();
+        assert!(restarted.leave_editor(false));
+        assert!(restarted.cached.is_empty());
+        restarted.open_path(path);
+        assert!(restarted.unlock.is_some());
+    }
+
+    #[test]
+    fn shortening_retention_expires_old_sessions_and_changes_on_disk_invalidate_cache() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        let first = store::create_test_note(&dir.0, "早离开");
+        let second = store::create_test_note(&dir.0, "刚离开");
+        let second_path = second.path.clone();
+        let now = Instant::now();
+        app.enter_editor(first);
+        app.cache_current(now - Duration::from_secs(120));
+        app.enter_editor(second);
+        app.cache_current(now);
+        let mut settings = app.settings;
+        settings.unlock_retention = UnlockRetention::Minutes(1);
+        app.apply_settings(settings).unwrap();
+        assert_eq!(app.cached.len(), 1);
+        let mut external = store::open(&second_path, "test-password").unwrap();
+        external.change_password("new-password").unwrap();
+        app.open_path(second_path);
+        assert!(app.cached.is_empty());
+        assert!(app.unlock.is_some());
+        assert!(app.editor.is_none());
+    }
+
+    #[test]
+    fn autosave_debounces_changes_respects_dialogs_and_stops_retrying_failures() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        let note = store::create_test_note(&dir.0, "自动保存");
+        let path = note.path.clone();
+        let original = std::fs::read(&path).unwrap();
+        app.enter_editor(note);
+        let ctx = egui::Context::default();
+        let start = Instant::now();
+        let ed = app.editor.as_mut().unwrap();
+        ed.opened.doc.sheets[0].blocks[0] = Block::with_text("第一次输入");
+        ed.dirty = true;
+        ed.finish_edit_frame(false, start);
+        app.poll_auto_save(&ctx, start + Duration::from_millis(1400));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let ed = app.editor.as_mut().unwrap();
+        ed.opened.doc.sheets[0].blocks[0] = Block::with_text("连续输入后的内容");
+        ed.finish_edit_frame(true, start + Duration::from_secs(1));
+        app.poll_auto_save(&ctx, start + Duration::from_secs(2));
+        assert!(app.editor.as_ref().unwrap().dirty);
+        app.open_settings();
+        app.poll_auto_save(&ctx, start + Duration::from_millis(2500));
+        assert!(app.editor.as_ref().unwrap().dirty);
+        app.settings_dialog.open = false;
+        app.poll_auto_save(&ctx, start + Duration::from_millis(2500));
+        assert!(!app.editor.as_ref().unwrap().dirty);
+        assert_eq!(store::open(&path, "test-password").unwrap().doc.sheets[0].blocks[0].text(), "连续输入后的内容");
+        assert_eq!(std::fs::read(path.with_extension("ecnote.bak")).unwrap(), original);
+
+        std::fs::remove_file(path.with_extension("ecnote.bak")).unwrap();
+        std::fs::create_dir(path.with_extension("ecnote.bak")).unwrap();
+        let ed = app.editor.as_mut().unwrap();
+        ed.opened.doc.sheets[0].blocks[0] = Block::with_text("失败后仍保留");
+        ed.dirty = true;
+        ed.finish_edit_frame(false, start);
+        app.poll_auto_save(&ctx, start + AUTO_SAVE_DELAY);
+        assert!(app.editor.as_ref().unwrap().auto_save_failed);
+        let failed_until = app.toast.as_ref().unwrap().until;
+        app.poll_auto_save(&ctx, start + Duration::from_secs(30));
+        assert_eq!(app.toast.as_ref().unwrap().until, failed_until);
+        assert!(app.editor.as_ref().unwrap().dirty);
+        std::fs::remove_dir(path.with_extension("ecnote.bak")).unwrap();
+        app.save_now();
+        assert!(!app.editor.as_ref().unwrap().dirty);
+        assert!(!app.editor.as_ref().unwrap().auto_save_failed);
+    }
+
+    #[test]
+    fn failed_save_blocks_return_lock_and_cached_switch_without_losing_either_note() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        let first = store::create_test_note(&dir.0, "目标");
+        let target = first.path.clone();
+        app.enter_editor(first);
+        app.leave_editor(false);
+        let second = store::create_test_note(&dir.0, "当前");
+        let current = second.path.clone();
+        std::fs::create_dir(second.backup_path()).unwrap();
+        app.enter_editor(second);
+        let ed = app.editor.as_mut().unwrap();
+        ed.opened.doc.sheets[0].blocks[0] = Block::with_text("不能丢失");
+        ed.dirty = true;
+        assert!(!app.leave_editor(false));
+        assert!(!app.leave_editor(true));
+        app.open_path(target.clone());
+        assert_eq!(app.editor.as_ref().unwrap().opened.path, current);
+        assert!(app.editor.as_ref().unwrap().dirty);
+        assert_eq!(app.cached.len(), 1);
+        assert_eq!(app.cached[0].editor.opened.path, target);
+        assert!(app.toast.as_ref().unwrap().text.contains("失败"));
+        std::fs::remove_dir(current.with_extension("ecnote.bak")).unwrap();
+        app.open_path(target.clone());
+        assert_eq!(app.editor.as_ref().unwrap().opened.path, target);
+        assert_eq!(app.cached.len(), 1);
+        assert!(!app.cached[0].editor.dirty);
+        assert_eq!(store::open(&current, "test-password").unwrap().doc.sheets[0].blocks[0].text(), "不能丢失");
+    }
+
+    #[test]
+    fn settings_modal_blocks_editor_shortcuts_and_restores_focus() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        app.enter_editor(store::create_test_note(&dir.0, "设置弹窗"));
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        dropped_file_frame(&ctx, &mut app, &[], Vec::new());
+        app.open_settings();
+        dropped_file_frame(&ctx, &mut app, &[], Vec::new());
+        dropped_file_frame(&ctx, &mut app, &[], vec![
+            image_key(egui::Key::N, egui::Modifiers::CTRL),
+            image_key(egui::Key::L, egui::Modifiers::CTRL),
+            egui::Event::Text("不能写进正文".to_owned()),
+        ]);
+        let ed = app.editor.as_ref().unwrap();
+        assert_eq!(ed.opened.doc.sheets.len(), 1);
+        assert!(ed.opened.doc.sheets[0].blocks[0].text().is_empty());
+        assert!(app.settings_dialog.open);
+        dropped_file_frame(&ctx, &mut app, &[], vec![
+            image_key(egui::Key::Escape, egui::Modifiers::NONE),
+        ]);
+        assert!(!app.settings_dialog.open);
+        dropped_file_frame(&ctx, &mut app, &[], Vec::new());
+        assert!(ctx.memory(|m| m.has_focus(app.editor.as_ref().unwrap().sheets[0].id)));
+    }
+
+    #[test]
+    fn settings_dropdown_stays_above_modal_while_pressing_blank_space() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        app.open_settings();
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let frame = |app: &mut App, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO, vec2(1180.0, 780.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.settings_ui(ui.ctx()),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let text_rect = |output: &egui::FullOutput, text: &str| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text_shape) if text_shape.galley.text() == text => {
+                    Some(egui::Rect::from_min_size(text_shape.pos, text_shape.galley.size()))
+                }
+                _ => None,
+            }).unwrap_or_else(|| panic!("未绘制 {text}"))
+        };
+        let pointer = |pos, pressed| vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        for _ in 0..3 { frame(&mut app, Vec::new()); }
+        let output = frame(&mut app, Vec::new());
+        let combo = text_rect(&output, "15 分钟").center();
+        frame(&mut app, pointer(combo, true));
+        frame(&mut app, pointer(combo, false));
+        let output = frame(&mut app, Vec::new());
+        let option = text_rect(&output, "1 分钟").center();
+        let popup_layer = ctx.layer_id_at(option).expect("下拉菜单应可交互");
+        assert!(egui::Popup::is_any_open(&ctx));
+        let blank = pos2(combo.x - 120.0, option.y);
+        assert_ne!(ctx.layer_id_at(blank), Some(popup_layer));
+        frame(&mut app, pointer(blank, true));
+        for _ in 0..3 { frame(&mut app, Vec::new()); }
+        if egui::Popup::is_any_open(&ctx) {
+            assert_eq!(ctx.layer_id_at(option), Some(popup_layer), "按住空白处不能将弹窗置于下拉菜单之上");
+        }
+        frame(&mut app, pointer(blank, false));
+        assert!(!egui::Popup::is_any_open(&ctx));
+        assert!(app.settings_dialog.open);
+        frame(&mut app, pointer(combo, true));
+        frame(&mut app, pointer(combo, false));
+        let output = frame(&mut app, Vec::new());
+        let five_minutes = text_rect(&output, "5 分钟").center();
+        frame(&mut app, pointer(five_minutes, true));
+        frame(&mut app, pointer(five_minutes, false));
+        assert_eq!(app.settings.unlock_retention, UnlockRetention::Minutes(5));
+        assert_eq!(Settings::load(&app.settings_path), app.settings);
+    }
+
     #[derive(Debug)]
     struct DroppedNote(PathBuf);
 
@@ -2658,6 +3318,10 @@ mod tests {
             toast: None,
             new_dir: None,
             open_error: None,
+            settings: Settings { auto_save: false, backup: false, ..Settings::default() },
+            settings_path: PathBuf::new(),
+            settings_dialog: SettingsDialog::default(),
+            cached: Vec::new(),
         };
         let ctx = egui::Context::default();
         dropped_file_frame(&ctx, &mut app, &[text.clone(), folder.clone()], Vec::new());
@@ -2708,6 +3372,10 @@ mod tests {
             toast: None,
             new_dir: None,
             open_error: None,
+            settings: Settings { auto_save: false, backup: false, ..Settings::default() },
+            settings_path: PathBuf::new(),
+            settings_dialog: SettingsDialog::default(),
+            cached: Vec::new(),
         };
         let ctx = egui::Context::default();
         theme::apply(&ctx);
@@ -2759,9 +3427,6 @@ mod tests {
         ed.opened.doc.sheets[0].blocks = vec![Block::with_text("重复拖入时保留")];
         ed.dirty = true;
         dropped_file_frame(&ctx, &mut app, &[target.clone()], Vec::new());
-        app.unlock.as_mut().unwrap().password = "target-password".to_owned();
-        app.start_open(&ctx);
-        wait_for_open(&ctx, &mut app);
         assert!(app.unlock.is_none());
         let ed = app.editor.as_ref().unwrap();
         assert!(ed.dirty);
@@ -2841,6 +3506,10 @@ mod tests {
             toast: None,
             new_dir: None,
             open_error: None,
+            settings: Settings { auto_save: false, backup: false, ..Settings::default() },
+            settings_path: PathBuf::new(),
+            settings_dialog: SettingsDialog::default(),
+            cached: Vec::new(),
         }
     }
 
@@ -3181,6 +3850,10 @@ mod tests {
             toast: None,
             new_dir: None,
             open_error: None,
+            settings: Settings { auto_save: false, backup: false, ..Settings::default() },
+            settings_path: PathBuf::new(),
+            settings_dialog: SettingsDialog::default(),
+            cached: Vec::new(),
         };
         let ctx = egui::Context::default();
         theme::apply(&ctx);
@@ -3265,6 +3938,10 @@ mod tests {
             toast: None,
             new_dir: None,
             open_error: None,
+            settings: Settings { auto_save: false, backup: false, ..Settings::default() },
+            settings_path: PathBuf::new(),
+            settings_dialog: SettingsDialog::default(),
+            cached: Vec::new(),
         };
         let mut show = |message: &str| {
             app.toast(message);

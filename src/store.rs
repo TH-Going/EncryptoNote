@@ -109,6 +109,13 @@ pub fn create(dir: &Path, file_stem: &str, password: &str) -> Result<Opened> {
     create_with_params(dir, file_stem, password, Argon2Params::DEFAULT)
 }
 
+#[cfg(test)]
+pub(crate) fn create_test_note(dir: &Path, name: &str) -> Opened {
+    create_with_params(dir, name, "test-password", Argon2Params {
+        m_cost: 8 * 1024, t_cost: 1, p_cost: 1,
+    }).unwrap()
+}
+
 fn create_with_params(
     dir: &Path,
     file_stem: &str,
@@ -199,7 +206,16 @@ pub fn open(path: &Path, password: &str) -> Result<Opened> {
 
 impl Opened {
     /// 原地保存：新文档密文追加到文件尾 + 切换头槽。
+    #[cfg(any(test, debug_assertions))]
     pub fn save(&mut self) -> Result<()> {
+        self.save_with_backup(false)
+    }
+
+    /// 备份成功后才写入原文件；备份始终是上一份磁盘密文。
+    pub fn save_with_backup(&mut self, backup: bool) -> Result<()> {
+        if self.over_limit() {
+            bail!("内容已超过 100 万字符，无法保存；请删减内容");
+        }
         self.doc.normalize();
 
         let doc_nonce = random_nonce();
@@ -214,6 +230,9 @@ impl Opened {
         let img_end = DATA_OFFSET + ciphertext_len(self.slot.img_len);
         let append_at = file_len.max(img_end).max(DATA_OFFSET);
 
+        if backup {
+            self.backup(&mut file)?;
+        }
         file.seek(SeekFrom::Start(append_at))?;
         file.write_all(&ct)?;
         file.flush()?;
@@ -241,6 +260,42 @@ impl Opened {
             let _ = self.compact();
         }
         Ok(())
+    }
+
+    pub fn backup_path(&self) -> PathBuf {
+        self.path.with_extension("ecnote.bak")
+    }
+
+    fn backup(&self, source: &mut File) -> Result<()> {
+        let target = self.backup_path();
+        let temp = self.path.with_extension(format!("{}.bak.tmp", recent::random_id()));
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&temp)?;
+            source.seek(SeekFrom::Start(0))?;
+            std::io::copy(source, &mut file)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, &target)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result.with_context(|| format!("无法更新备份 {}", target.display()))
+    }
+
+    /// 缓存回开前验证文件头与密文；文件被替换、改密或损坏时要求重新解锁。
+    pub fn matches_disk(&self) -> bool {
+        let check = (|| -> Result<bool> {
+            let mut file = File::open(&self.path)?;
+            let Ok(header) = FileHeader::read_from(&mut file)? else { return Ok(false) };
+            if header.read() != Some(&self.slot) {
+                return Ok(false);
+            }
+            decrypt_doc(&self.dek, &self.slot, &mut file)?;
+            Ok(true)
+        })();
+        check.unwrap_or(false)
     }
 
     /// 丢弃追加产生的垃圾：头 + 图片 + 文档重排到紧凑布局。
@@ -425,5 +480,61 @@ mod tests {
         create_with_params(&d, "dup", "pw", FAST).unwrap();
         assert!(create_with_params(&d, "dup", "pw", FAST).is_err());
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn backup_keeps_previous_encrypted_version_and_can_be_disabled() {
+        let d = dir();
+        let mut note = create_with_params(&d, "备份", "pw", FAST).unwrap();
+        let original = std::fs::read(&note.path).unwrap();
+        note.doc.sheets[0].blocks[0] = crate::model::Block::with_text("第一次修改");
+        note.save_with_backup(true).unwrap();
+        assert_eq!(std::fs::read(note.backup_path()).unwrap(), original);
+        let first = std::fs::read(&note.path).unwrap();
+        note.doc.sheets[0].blocks[0] = crate::model::Block::with_text("第二次修改");
+        note.save_with_backup(true).unwrap();
+        assert_eq!(std::fs::read(note.backup_path()).unwrap(), first);
+        let restored = d.join("恢复.ecnote");
+        std::fs::copy(note.backup_path(), &restored).unwrap();
+        assert_eq!(open(&restored, "pw").unwrap().doc.sheets[0].blocks[0].text(), "第一次修改");
+        note.doc.sheets[0].blocks[0] = crate::model::Block::with_text("第三次修改");
+        note.save_with_backup(false).unwrap();
+        assert_eq!(std::fs::read(note.backup_path()).unwrap(), first);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 3);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn backup_failure_does_not_touch_note_or_leave_temporary_files() {
+        let d = dir();
+        let mut note = create_with_params(&d, "备份失败", "pw", FAST).unwrap();
+        let original = std::fs::read(&note.path).unwrap();
+        let slot = note.slot.clone();
+        std::fs::create_dir(note.backup_path()).unwrap();
+        note.doc.sheets[0].blocks[0] = crate::model::Block::with_text("未保存的修改");
+        assert!(note.save_with_backup(true).is_err());
+        assert_eq!(std::fs::read(&note.path).unwrap(), original);
+        assert_eq!(note.slot, slot);
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 2);
+        assert_eq!(note.doc.sheets[0].blocks[0].text(), "未保存的修改");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn cached_document_detects_password_changes_and_damaged_ciphertext() {
+        let d = dir();
+        let note = create_with_params(&d, "缓存校验", "pw", FAST).unwrap();
+        assert!(note.matches_disk());
+        let mut other = open(&note.path, "pw").unwrap();
+        other.change_password("new").unwrap();
+        assert!(!note.matches_disk());
+        assert!(other.matches_disk());
+        let mut bytes = std::fs::read(&note.path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&note.path, bytes).unwrap();
+        assert!(!other.matches_disk());
+        std::fs::remove_file(&note.path).unwrap();
+        assert!(!other.matches_disk());
+        std::fs::remove_dir(&d).unwrap();
     }
 }

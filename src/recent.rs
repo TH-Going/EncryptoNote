@@ -42,11 +42,17 @@ pub fn random_id() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+#[cfg(not(test))]
 pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     base.join("EncryptoNote")
+}
+
+#[cfg(test)]
+pub fn config_dir() -> PathBuf {
+    tests::config_dir()
 }
 
 fn recent_path() -> PathBuf {
@@ -159,6 +165,41 @@ pub fn sanitize_file_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestConfigDir(PathBuf);
+
+    impl Drop for TestConfigDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    thread_local! {
+        // 每个测试线程独立存储，避免修改真实最近记录，也无需更改进程环境。
+        static CONFIG_DIR: TestConfigDir = TestConfigDir(
+            std::env::temp_dir().join(format!("ecnote-config-test-{}", random_id()))
+        );
+    }
+
+    pub(super) fn config_dir() -> PathBuf {
+        CONFIG_DIR.with(|dir| dir.0.clone())
+    }
+
+    #[test]
+    fn test_storage_is_isolated_and_cleaned_up() {
+        let own_dir = super::config_dir();
+        let other_dir = std::thread::spawn(|| {
+            let dir = super::config_dir();
+            touch(&dir.join("test.ecnote"), "测试笔记", 0);
+            assert!(dir.join("recent.json").is_file());
+            dir
+        })
+        .join()
+        .unwrap();
+        assert_ne!(own_dir, other_dir);
+        assert!(!own_dir.exists());
+        assert!(!other_dir.exists());
+    }
 
     #[test]
     fn sanitize_keeps_chinese() {

@@ -6,6 +6,7 @@ mod editor;
 mod format;
 mod model;
 mod recent;
+mod settings;
 mod store;
 mod stream;
 mod ui;
