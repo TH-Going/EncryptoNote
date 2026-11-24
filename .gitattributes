@@ -1,0 +1,16 @@
+# 统一换行：仓库内用 LF，检出到 Windows 时 CRLF
+* text=auto
+
+# Rust / 配置
+*.rs   text
+*.toml text
+*.md   text
+*.json text
+
+# PowerShell 脚本带 UTF-8 BOM（PS 5.1 需要），保持 CRLF
+*.ps1  text eol=crlf
+
+# 二进制资源
+*.png  binary
+*.ico  binary
+*.exe  binary

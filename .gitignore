@@ -1,0 +1,44 @@
+# ---- Rust 构建产物 ----
+/target/
+**/*.rs.bk
+*.pdb
+
+# ---- 交付/构建复制出来的 exe（由 target/release 重新生成）----
+/EncryptoNote.exe
+/encrypto-note.exe
+/密笺.exe
+/文件加密器.exe
+
+# ---- 本地测试数据（脚本现场生成，体积大且会含明文，不入库）----
+/_demo/
+/_demo2/
+/_demo3/
+/_demo4/
+/_testdata/
+/_big/
+/_e2e*/
+/bigdata/
+
+# ---- 运行时产物：加密文件、临时分块、日志、便携配置 ----
+*.ecnote
+*.fenc
+*.part
+.fenc-journal.csv
+.encrypto-note.last
+
+# ---- 截图与临时图片（capture.ps1 产物）----
+/shot*.png
+/crop*.png
+/bmp*.png
+
+# ---- 编辑器 / 系统 ----
+/.vs/
+/.vscode/
+/.idea/
+*.swp
+*~
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.log
+nohup.out

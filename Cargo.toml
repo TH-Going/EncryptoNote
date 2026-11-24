@@ -1,0 +1,31 @@
+[package]
+name = "encrypto-note"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.22"
+# 固定用 RustCrypto 的稳定线（0.5/0.10）；0.6/0.11 是下一代实验 API，stream 模式尚未稳定
+argon2 = "0.5"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+crc32fast = "1.5.5"
+eframe = "0.37.0"
+egui = "0.37.0"
+# 富文本：只做光标/选区，排版由应用负责（与 egui 0.37 严格匹配）
+egui_richedit = "=0.18.1"
+filetime = "0.2.30"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1.12.0"
+rfd = "0.18.0"
+sha2 = "0.10"
+thiserror = "2.0.21"
+zeroize = "1.9.2"
+arboard = { version = "3", features = ["image-data"] }
+
+[build-dependencies]
+winres = "0.1.12"
