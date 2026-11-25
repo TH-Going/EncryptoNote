@@ -5,7 +5,7 @@ fn main() {
     let mut res = winres::WindowsResource::new();
     res.set_icon("app.ico");
     res.set("ProductName", "EncryptoNote");
-    res.set("FileDescription", "EncryptoNote - encrypted rich-text notes");
+    res.set("FileDescription", "EncryptoNote - 加密富文本笔记");
     res.set("LegalCopyright", "");
     // 找不到 rc.exe 时只告警，不阻断构建
     if let Err(e) = res.compile() {

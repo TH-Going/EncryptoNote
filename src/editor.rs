@@ -616,26 +616,15 @@ pub struct ParagraphMetrics {
     pub prefix: Option<String>,
 }
 
-fn prefix_for(blocks: &[Block], index: usize) -> ParagraphMetrics {
-    let kind = blocks[index].kind;
-    let mut n = 0;
-    if kind == BlockKind::Number {
-        for b in blocks[..=index].iter().rev() {
-            if b.kind == BlockKind::Number {
-                n += 1;
-            } else {
-                break;
-            }
-        }
-    }
+fn prefix_for(kind: BlockKind, number: usize, number_indent: f32) -> ParagraphMetrics {
     match kind {
         BlockKind::Bullet => ParagraphMetrics {
             indent: 24.0,
             prefix: Some("•".to_owned()),
         },
         BlockKind::Number => ParagraphMetrics {
-            indent: 26.0,
-            prefix: Some(format!("{n}.")),
+            indent: number_indent,
+            prefix: Some(format!("{number}.")),
         },
         BlockKind::Quote => ParagraphMetrics {
             indent: 14.0,
@@ -887,7 +876,26 @@ pub fn draw_document(
     let mut paragraph_rects = Vec::with_capacity(blocks.len());
     let mut image_hit = false;
     let pointer = ui.input(|i| i.pointer.interact_pos());
+    let mut number = 0;
+    let mut number_indent = 26.0;
     for (index, block) in blocks.iter().enumerate() {
+        if block.kind == BlockKind::Number {
+            if number == 0 {
+                let count = blocks[index..].iter()
+                    .take_while(|block| block.kind == BlockKind::Number).count();
+                let font = FontId::proportional(size_of(BlockKind::Number));
+                // 同一段列表统一缩进，并按实际字体宽度容纳两位及更长编号。
+                let widest = ui.fonts_mut(|fonts| (1..=count)
+                    .map(|number| fonts.layout_no_wrap(
+                        format!("{number}."), font.clone(), ink,
+                    ).size().x)
+                    .fold(0.0_f32, f32::max));
+                number_indent = (widest + 12.0).max(26.0);
+            }
+            number += 1;
+        } else {
+            number = 0;
+        }
         if block.kind == BlockKind::Image {
             let id = block.runs.first().map(|r| r.text.clone()).unwrap_or_default();
             let asset = images.iter().find(|a| a.id == id);
@@ -1096,7 +1104,7 @@ pub fn draw_document(
             ui.add_space(6.0);
             continue;
         }
-        let metrics = prefix_for(blocks, index);
+        let metrics = prefix_for(block.kind, number, number_indent);
         let text_width = (width - metrics.indent - 12.0).max(80.0);
         let job_len = text_width;
         let mut job = ParagraphJob::new(LayoutJob {
@@ -1149,9 +1157,14 @@ pub fn draw_document(
             painter.rect_filled(bar, 2.0, theme::ACCENT.gamma_multiply(0.45));
         }
         if let Some(prefix) = &metrics.prefix {
+            let (x, anchor) = if block.kind == BlockKind::Number {
+                (metrics.indent - 8.0, egui::Align2::RIGHT_TOP)
+            } else {
+                (metrics.indent - 14.0, egui::Align2::LEFT_TOP)
+            };
             painter.text(
-                rect.left_top() + vec2(metrics.indent - 14.0, pad_top + 2.0),
-                egui::Align2::LEFT_TOP,
+                rect.left_top() + vec2(x, pad_top + 2.0),
+                anchor,
                 prefix,
                 FontId::new(size_of(block.kind), FontFamily::Proportional),
                 ink.gamma_multiply(0.65),
@@ -1328,6 +1341,59 @@ pub fn set_text_color(
 mod tests {
     use super::*;
     use crate::model::Doc;
+
+    #[test]
+    fn numbered_prefix_does_not_overlap_body() {
+        for count in [1, 9, 10, 99, 100, 999, 1000] {
+            let ctx = egui::Context::default();
+            let mut rt = SheetEditor::new(egui::Id::unique(("number-layout", count)));
+            let mut blocks: Vec<Block> = (0..count).map(|index| {
+                let mut block = Block::with_text(if index + 1 == count { "891 102" } else { "row" });
+                block.kind = BlockKind::Number;
+                block
+            }).collect();
+            let mut dirty = false;
+            let mut bounds = None;
+            for frame in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO, vec2(640.0, 50.0 * count as f32 + 100.0),
+                        )),
+                        time: Some(frame as f64 / 60.0),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        rt.editor.input(ui, &mut ActiveSheet {
+                            blocks: &mut blocks, undo: &mut rt.undo,
+                            pending: &mut rt.pending, dirty: &mut dirty,
+                        });
+                        draw_document(ui, &blocks, &mut rt, 480.0, theme::TEXT, &[], &mut None);
+                    },
+                );
+                let text_rect = |needle: &str| output.shapes.iter().find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == needle
+                    {
+                        Some(text.visual_bounding_rect())
+                    } else {
+                        None
+                    }
+                }).unwrap_or_else(|| panic!("未绘制 {needle}"));
+                bounds = Some((text_rect(&format!("{count}.")), text_rect("891 102")));
+                if count > 1 {
+                    assert!((text_rect("row").left() - text_rect("891 102").left()).abs() < 1.0,
+                        "同一编号列表的正文应对齐");
+                }
+                output.textures_delta.clear();
+            }
+            let (prefix, body) = bounds.unwrap();
+            assert!(prefix.bottom() > body.top() && prefix.top() < body.bottom());
+            assert!(prefix.left() >= 0.0, "编号 {count} 超出了段落左边界");
+            assert!(prefix.right() + 6.0 <= body.left(),
+                "编号 {count} 与正文重叠：编号右侧 {}，正文左侧 {}", prefix.right(), body.left());
+        }
+    }
 
     fn image_block() -> Block {
         let mut image = Block::with_text("img-regression-asset");

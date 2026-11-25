@@ -5,6 +5,7 @@ mod crypto;
 mod editor;
 mod format;
 mod model;
+mod platform;
 mod recent;
 mod settings;
 mod store;
@@ -30,6 +31,16 @@ fn app_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    let instance = match platform::Instance::start() {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            platform::show_error(&format!("{error:#}"));
+            return Err(eframe::Error::AppCreation(error.into()));
+        }
+    };
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([WIN_W, WIN_H])
@@ -45,10 +56,13 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "EncryptoNote",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             ui::theme::apply(&cc.egui_ctx);
             ui::fonts::install(&cc.egui_ctx);
-            Ok(Box::new(app::App::default()))
+            let mut app = app::App::default();
+            #[cfg(windows)]
+            app.attach_desktop(instance.attach(&cc.egui_ctx));
+            Ok(Box::new(app))
         }),
     )
 }

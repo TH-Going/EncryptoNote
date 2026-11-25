@@ -1,5 +1,6 @@
 //! EncryptoNote：加密笔记（`.ecnote`）应用主界面。
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
@@ -13,6 +14,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::editor::{self, ActiveSheet, SheetEditor, mark_of};
 use crate::model::{Align as DocAlign, Block, BlockKind, ImageAsset, Run, Sheet};
+#[cfg(windows)]
+use crate::platform;
 use crate::recent::{self, RecentEntry};
 use crate::settings::{Settings, UnlockRetention};
 use crate::store::{self, Opened};
@@ -167,6 +170,23 @@ enum View {
     Editor,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum CloseAction {
+    Hide,
+    Exit,
+}
+
+#[derive(Default)]
+struct DesktopState {
+    #[cfg(windows)]
+    runtime: Option<platform::Desktop>,
+    tray_available: bool,
+    open_requests: VecDeque<PathBuf>,
+    pending_close: Option<CloseAction>,
+    allow_exit: bool,
+    skip_ui: bool,
+}
+
 pub struct App {
     view: View,
     entries: Vec<RecentEntry>,
@@ -181,6 +201,7 @@ pub struct App {
     settings_path: PathBuf,
     settings_dialog: SettingsDialog,
     cached: Vec<CachedEditor>,
+    desktop: DesktopState,
 }
 
 impl Default for App {
@@ -199,6 +220,7 @@ impl Default for App {
             settings_path: Settings::path(),
             settings_dialog: SettingsDialog::default(),
             cached: Vec::new(),
+            desktop: DesktopState::default(),
         };
         if let Some(home) = std::env::var_os("ECNOTE_HOME") {
             let dir = PathBuf::from(home);
@@ -541,9 +563,11 @@ impl App {
         self.new_dir = Some(dir.clone());
         let pw = Zeroizing::new(self.new.password.clone());
         let (tx, rx) = channel();
+        let wake = ctx.clone();
         std::thread::spawn(move || {
             let res = store::create(&dir, &name, &pw).map_err(|e| format!("{e:#}"));
             let _ = tx.send(res);
+            wake.request_repaint();
         });
         self.pending = Some(Pending {
             rx,
@@ -563,9 +587,11 @@ impl App {
         u.error = None;
         u.busy = true;
         let (tx, rx) = channel();
+        let wake = ctx.clone();
         std::thread::spawn(move || {
             let res = store::open(&path, &pw).map_err(|e| format!("{e:#}"));
             let _ = tx.send(res);
+            wake.request_repaint();
         });
         self.pending = Some(Pending {
             rx,
@@ -628,15 +654,101 @@ impl App {
             self.open_path(path.to_path_buf());
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// eframe 入口
-// ---------------------------------------------------------------------------
+    #[cfg(windows)]
+    pub fn attach_desktop(&mut self, desktop: platform::Desktop) {
+        self.desktop.tray_available = desktop.has_tray();
+        self.desktop.runtime = Some(desktop);
+    }
 
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    #[cfg(windows)]
+    fn poll_platform(&mut self, ctx: &egui::Context) {
+        let events = self.desktop.runtime.as_ref()
+            .map(|runtime| runtime.drain_events()).unwrap_or_default();
+        for event in events {
+            match event {
+                platform::Event::Open(paths) => {
+                    self.queue_open_requests(paths);
+                    self.show_window(ctx);
+                }
+                platform::Event::Show => self.show_window(ctx),
+                platform::Event::Exit => {
+                    self.desktop.pending_close = Some(CloseAction::Exit);
+                    ctx.request_repaint();
+                }
+                platform::Event::Error(error) => {
+                    self.show_window(ctx);
+                    platform::show_error(&error);
+                }
+            }
+        }
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.desktop.skip_ui = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.request_repaint();
+    }
+
+    fn queue_open_requests(&mut self, paths: Vec<PathBuf>) {
+        for path in paths {
+            if !self.desktop.open_requests.iter().any(|queued| same_note(queued, &path))
+                && !self.unlock.as_ref().is_some_and(|unlock| same_note(&unlock.path, &path))
+            {
+                self.desktop.open_requests.push_back(path);
+            }
+        }
+    }
+
+    fn poll_open_requests(&mut self) {
+        while self.pending.is_none() && !self.dialog_open()
+            && self.desktop.pending_close.is_none()
+        {
+            let Some(path) = self.desktop.open_requests.pop_front() else { break };
+            if path.is_file() {
+                self.open_path(path);
+            } else {
+                self.toast(format!("无法打开文件：{}", path.display()));
+            }
+        }
+    }
+
+    fn finish_close(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.desktop.pending_close else { return };
+        // 等待后台新建/解锁收尾，避免退出时中断写入。
+        if self.pending.is_some() {
+            return;
+        }
+        self.desktop.pending_close = None;
+        if let Err(error) = self.save_current() {
+            self.show_window(ctx);
+            self.toast(format!("保存失败，已取消关闭：{error}"));
+            return;
+        }
+        self.desktop.skip_ui = true;
+        match action {
+            CloseAction::Hide => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            CloseAction::Exit => {
+                self.cached.clear();
+                self.editor = None;
+                self.unlock = None;
+                self.new.password.zeroize();
+                self.new.confirm.zeroize();
+                self.desktop.allow_exit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn background_logic(&mut self, ctx: &egui::Context) {
+        if self.desktop.allow_exit {
+            return;
+        }
+        self.desktop.skip_ui = false;
         let now = Instant::now();
         self.expire_cached(now);
         if let Some(duration) = self.settings.unlock_retention.duration()
@@ -646,12 +758,49 @@ impl eframe::App for App {
         {
             ctx.request_repaint_after(remaining);
         }
+        self.poll_pending();
+        // 上一轮没有 UI（隐藏/最小化）时，在这里完成关闭。
+        self.finish_close(ctx);
+        if self.desktop.allow_exit {
+            return;
+        }
+        #[cfg(windows)]
+        self.poll_platform(ctx);
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.desktop.pending_close.is_none() {
+                self.desktop.pending_close = Some(if self.desktop.tray_available {
+                    CloseAction::Hide
+                } else {
+                    CloseAction::Exit
+                });
+            }
+            ctx.request_repaint();
+        }
+        self.poll_open_requests();
+        self.poll_auto_save(ctx, now);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eframe 入口
+// ---------------------------------------------------------------------------
+
+impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.background_logic(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.desktop.allow_exit || self.desktop.skip_ui {
+            return;
+        }
+        let ctx = ui.ctx().clone();
         self.handle_dropped_files(&ctx);
         if self.dialog_open() {
             // 对话框内容会随输入增长，保持连续重绘让窗口尺寸/命中区域及时更新
             ctx.request_repaint();
         }
-        self.poll_pending();
 
         if let Some(t) = &self.toast
             && Instant::now() > t.until
@@ -672,14 +821,10 @@ impl eframe::App for App {
         self.sheet_dialogs(&ctx);
         self.settings_ui(&ctx);
         self.poll_auto_save(&ctx, Instant::now());
-        if ctx.input(|i| i.viewport().close_requested()) {
-            if let Err(error) = self.save_current() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.toast(format!("保存失败，已取消关闭：{error}"));
-            } else {
-                self.cached.clear();
-                self.editor = None;
-            }
+        // 帧末保存包含本帧最后一次编辑；无 UI 的帧由 background_logic 收尾。
+        self.finish_close(&ctx);
+        if !self.desktop.open_requests.is_empty() && !self.dialog_open() {
+            ctx.request_repaint();
         }
         self.toast_ui(&ctx);
     }
@@ -2964,6 +3109,7 @@ mod tests {
                 settings_path,
                 settings_dialog: SettingsDialog::default(),
                 cached: Vec::new(),
+                desktop: DesktopState::default(),
             }
         }
     }
@@ -2972,6 +3118,161 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    fn background_frame(ctx: &egui::Context, app: &mut App, close: bool) -> egui::LogicOutput {
+        let mut input = egui::RawInput::default();
+        let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.minimized = Some(true);
+        if close {
+            viewport.events.push(egui::ViewportEvent::Close);
+        }
+        ctx.run_logic(&input, |ctx| app.background_logic(ctx))
+    }
+
+    #[test]
+    fn external_files_wait_for_dialogs_and_background_tasks_in_order() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        let first = store::create_test_note(&dir.0, "第一份");
+        let first_path = first.path.clone();
+        let second = store::create_test_note(&dir.0, "第二份").path;
+        let ctx = egui::Context::default();
+        app.settings_dialog.open = true;
+        app.queue_open_requests(vec![first_path.clone(), second.clone(), first_path.clone()]);
+        background_frame(&ctx, &mut app, false);
+        assert!(app.unlock.is_none());
+        assert_eq!(app.desktop.open_requests.len(), 2);
+        app.settings_dialog.open = false;
+        background_frame(&ctx, &mut app, false);
+        assert_eq!(app.unlock.as_ref().unwrap().path, first_path);
+        background_frame(&ctx, &mut app, false);
+        assert_eq!(app.unlock.as_ref().unwrap().path, first_path);
+        let (tx, rx) = channel();
+        app.pending = Some(Pending { rx, task: Task::Open });
+        background_frame(&ctx, &mut app, false);
+        assert_eq!(app.desktop.open_requests.len(), 1);
+        tx.send(Ok(first)).unwrap();
+        background_frame(&ctx, &mut app, false);
+        assert_eq!(app.editor.as_ref().unwrap().opened.path, first_path);
+        assert_eq!(app.unlock.as_ref().unwrap().path, second);
+        assert!(app.desktop.open_requests.is_empty());
+    }
+
+    #[test]
+    fn hidden_window_expires_cached_keys_and_runs_autosave() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        app.settings.unlock_retention = UnlockRetention::Minutes(1);
+        app.enter_editor(store::create_test_note(&dir.0, "已离开"));
+        app.cache_current(Instant::now() - Duration::from_secs(61));
+        let current = store::create_test_note(&dir.0, "后台保存");
+        let path = current.path.clone();
+        app.enter_editor(current);
+        let ed = app.editor.as_mut().unwrap();
+        ed.opened.doc.sheets[0].blocks[0] = Block::with_text("最小化时也保存");
+        ed.dirty = true;
+        ed.last_edit = Some(Instant::now() - Duration::from_secs(2));
+        background_frame(&egui::Context::default(), &mut app, false);
+        assert!(app.cached.is_empty());
+        assert!(!app.editor.as_ref().unwrap().dirty);
+        assert_eq!(
+            store::open(&path, "test-password").unwrap().doc.sheets[0].blocks[0].text(),
+            "最小化时也保存",
+        );
+    }
+
+    #[test]
+    fn hidden_exit_preserves_unsaved_content_on_failure_and_allows_retry() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        app.settings.auto_save = false;
+        let note = store::create_test_note(&dir.0, "退出保存");
+        let path = note.path.clone();
+        let backup = note.backup_path();
+        std::fs::create_dir(&backup).unwrap();
+        app.enter_editor(note);
+        let ed = app.editor.as_mut().unwrap();
+        ed.opened.doc.sheets[0].blocks[0] = Block::with_text("退出前不能丢失");
+        ed.dirty = true;
+        let ctx = egui::Context::default();
+        app.desktop.pending_close = Some(CloseAction::Exit);
+        let output = background_frame(&ctx, &mut app, false);
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(commands.contains(&egui::ViewportCommand::Visible(true)));
+        assert!(commands.contains(&egui::ViewportCommand::Minimized(false)));
+        assert!(!commands.contains(&egui::ViewportCommand::Close));
+        assert!(!app.desktop.allow_exit);
+        assert!(app.editor.as_ref().unwrap().dirty);
+        assert!(app.toast.as_ref().unwrap().text.contains("保存失败"));
+        std::fs::remove_dir(&backup).unwrap();
+        app.desktop.pending_close = Some(CloseAction::Exit);
+        let output = background_frame(&ctx, &mut app, false);
+        assert!(output.viewport_commands[&egui::ViewportId::ROOT].contains(&egui::ViewportCommand::Close));
+        assert!(app.desktop.allow_exit);
+        assert!(app.editor.is_none());
+        assert_eq!(
+            store::open(&path, "test-password").unwrap().doc.sheets[0].blocks[0].text(),
+            "退出前不能丢失",
+        );
+        let output = background_frame(&ctx, &mut app, true);
+        assert!(!output.viewport_commands.get(&egui::ViewportId::ROOT)
+            .is_some_and(|commands| commands.contains(&egui::ViewportCommand::CancelClose)));
+    }
+
+    #[test]
+    fn exit_waits_for_pending_create_and_missing_tray_falls_back_to_exit() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        let ctx = egui::Context::default();
+        let (tx, rx) = channel();
+        app.pending = Some(Pending { rx, task: Task::Create });
+        let output = background_frame(&ctx, &mut app, true);
+        assert!(output.viewport_commands[&egui::ViewportId::ROOT].contains(&egui::ViewportCommand::CancelClose));
+        assert!(app.desktop.pending_close == Some(CloseAction::Exit));
+        background_frame(&ctx, &mut app, false);
+        assert!(!app.desktop.allow_exit);
+        let created = store::create_test_note(&dir.0, "创建完成");
+        let path = created.path.clone();
+        tx.send(Ok(created)).unwrap();
+        background_frame(&ctx, &mut app, false);
+        assert!(app.desktop.allow_exit);
+        assert!(store::open(&path, "test-password").is_ok());
+    }
+
+    #[test]
+    fn close_to_tray_saves_text_entered_in_the_same_frame() {
+        let dir = SessionDir::new();
+        let mut app = dir.app();
+        app.settings.auto_save = false;
+        app.desktop.tray_available = true;
+        let note = store::create_test_note(&dir.0, "关闭同帧输入");
+        let path = note.path.clone();
+        app.enter_editor(note);
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        for _ in 0..3 {
+            dropped_file_frame(&ctx, &mut app, &[], Vec::new());
+        }
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(1180.0, 780.0))),
+            events: vec![egui::Event::Text("关闭前最后输入".into())],
+            ..Default::default()
+        };
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().events.push(egui::ViewportEvent::Close);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut output = ctx.run_ui(input, |ui| {
+            eframe::App::logic(&mut app, ui.ctx(), &mut frame);
+            eframe::App::ui(&mut app, ui, &mut frame);
+        });
+        output.textures_delta.clear();
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(commands.contains(&egui::ViewportCommand::CancelClose));
+        assert!(commands.contains(&egui::ViewportCommand::Visible(false)));
+        assert!(!app.desktop.allow_exit);
+        assert!(!app.editor.as_ref().unwrap().dirty);
+        assert!(store::open(&path, "test-password").unwrap().doc.sheets[0].blocks[0]
+            .text().contains("关闭前最后输入"));
     }
 
     #[test]
@@ -3282,7 +3583,10 @@ mod tests {
                 events,
                 ..Default::default()
             },
-            |ui| eframe::App::ui(app, ui, &mut frame),
+            |ui| {
+                eframe::App::logic(app, ui.ctx(), &mut frame);
+                eframe::App::ui(app, ui, &mut frame);
+            },
         );
         output.textures_delta.clear();
     }
@@ -3322,6 +3626,7 @@ mod tests {
             settings_path: PathBuf::new(),
             settings_dialog: SettingsDialog::default(),
             cached: Vec::new(),
+            desktop: DesktopState::default(),
         };
         let ctx = egui::Context::default();
         dropped_file_frame(&ctx, &mut app, &[text.clone(), folder.clone()], Vec::new());
@@ -3376,6 +3681,7 @@ mod tests {
             settings_path: PathBuf::new(),
             settings_dialog: SettingsDialog::default(),
             cached: Vec::new(),
+            desktop: DesktopState::default(),
         };
         let ctx = egui::Context::default();
         theme::apply(&ctx);
@@ -3510,6 +3816,7 @@ mod tests {
             settings_path: PathBuf::new(),
             settings_dialog: SettingsDialog::default(),
             cached: Vec::new(),
+            desktop: DesktopState::default(),
         }
     }
 
@@ -3854,6 +4161,7 @@ mod tests {
             settings_path: PathBuf::new(),
             settings_dialog: SettingsDialog::default(),
             cached: Vec::new(),
+            desktop: DesktopState::default(),
         };
         let ctx = egui::Context::default();
         theme::apply(&ctx);
@@ -3942,6 +4250,7 @@ mod tests {
             settings_path: PathBuf::new(),
             settings_dialog: SettingsDialog::default(),
             cached: Vec::new(),
+            desktop: DesktopState::default(),
         };
         let mut show = |message: &str| {
             app.toast(message);
